@@ -1,0 +1,148 @@
+"""
+Instagram Following Deep Scraper - VERSIÓN CORREGIDA
+Selenium: login + obtención de SEGUIDOS
+Playwright: extracción paralela de followers, following y bio
+Salida: Excel (.xlsx)
+"""
+
+from selenium import webdriver
+from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from webdriver_manager.chrome import ChromeDriverManager
+from playwright.async_api import async_playwright
+import asyncio
+import random
+import time
+import os
+import json
+import pandas as pd
+from dotenv import load_dotenv
+
+# ===================== ENV =====================
+load_dotenv()
+IG_USERNAME = os.getenv("IG_USERNAME")
+IG_PASSWORD = os.getenv("IG_PASSWORD")
+TARGET_ACCOUNT = os.getenv("TARGET_ACCOUNT")
+FOLLOWING_LIMIT = int(os.getenv("FOLLOWER_COUNT", "50"))
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", "10"))
+
+# ===================== SELENIUM =====================
+def setup_driver():
+    options = webdriver.ChromeOptions()
+    options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_argument("--window-size=1920,1080")
+    service = Service(ChromeDriverManager().install())
+    return webdriver.Chrome(service=service, options=options)
+
+def login(driver):
+    driver.get("https://www.instagram.com/")
+    WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.NAME, "username")))
+    driver.find_element(By.NAME, "username").send_keys(IG_USERNAME)
+    driver.find_element(By.NAME, "password").send_keys(IG_PASSWORD + Keys.ENTER)
+    time.sleep(5)
+
+def extract_following(driver, account, limit):
+    driver.get(f"https://www.instagram.com/{account}/")
+    time.sleep(3)
+
+    driver.find_element(By.XPATH, "//a[contains(@href,'/following')]").click()
+    time.sleep(3)
+
+    users = set()
+    dialog = driver.find_element(By.XPATH, "//div[@role='dialog']")
+
+    while len(users) < limit:
+        links = dialog.find_elements(By.XPATH, ".//a[contains(@href,'/')]")
+        for link in links:
+            href = link.get_attribute("href")
+            if href:
+                user = href.split("instagram.com/")[-1].strip("/").split("/")[0]
+                if user and user != account:
+                    users.add(user)
+            if len(users) >= limit:
+                break
+        driver.execute_script("arguments[0].scrollTop = arguments[0].scrollHeight", dialog)
+        time.sleep(2)
+
+    return list(users)
+
+def save_cookies(driver, path="cookies.json"):
+    with open(path, "w") as f:
+        json.dump(driver.get_cookies(), f)
+
+# ===================== PLAYWRIGHT =====================
+async def get_profile_data(context, username):
+    page = await context.new_page()
+    await page.goto(f"https://www.instagram.com/{username}/", wait_until="domcontentloaded")
+    await page.wait_for_timeout(2000)
+
+    followers = following = None
+    bio = ""
+
+    links = await page.query_selector_all("a")
+    for link in links:
+        href = await link.get_attribute("href")
+        text = (await link.inner_text()).lower()
+        if href and "/followers/" in href:
+            followers = int(text.split()[0].replace(",", "").replace(".", ""))
+        if href and "/following/" in href:
+            following = int(text.split()[0].replace(",", "").replace(".", ""))
+
+    try:
+        bio_el = await page.query_selector("div.-vDIg span")
+        if bio_el:
+            bio = await bio_el.inner_text()
+    except:
+        pass
+
+    await page.close()
+    return {
+        "username": username,
+        "followers": followers,
+        "following": following,
+        "bio": bio
+    }
+
+async def analyze_profiles(usernames, cookies):
+    results = []
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        context = await browser.new_context()
+
+        await context.add_cookies(cookies)
+
+        sem = asyncio.Semaphore(MAX_WORKERS)
+
+        async def sem_task(user):
+            async with sem:
+                data = await get_profile_data(context, user)
+                results.append(data)
+                await asyncio.sleep(random.uniform(0.5, 1.2))
+
+        await asyncio.gather(*(sem_task(u) for u in usernames))
+        await browser.close()
+    return results
+
+# ===================== MAIN =====================
+def main():
+    driver = setup_driver()
+    login(driver)
+
+    following_users = extract_following(driver, TARGET_ACCOUNT, FOLLOWING_LIMIT)
+    save_cookies(driver)
+    cookies = driver.get_cookies()
+    driver.quit()
+
+    data = asyncio.run(analyze_profiles(following_users, cookies))
+
+    df = pd.DataFrame(data)
+    df.insert(0, "source_account", TARGET_ACCOUNT)
+    df.to_excel(f"{TARGET_ACCOUNT}_following_analysis.xlsx", index=False)
+
+    print("Excel generado correctamente")
+
+if __name__ == "__main__":
+    main()
